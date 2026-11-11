@@ -1,0 +1,10 @@
+version: '3.8'
+
+services:
+  duplicate-bot:
+    build: .
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - .:/app
