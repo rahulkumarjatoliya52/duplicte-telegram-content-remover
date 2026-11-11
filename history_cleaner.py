@@ -1,50 +1,67 @@
+"""
+History cleaner. Runs entirely in memory: nothing is written to the database while scanning.
+The OLDEST copy of every file is the original and is never deleted.
+"""
 import asyncio
 import logging
 import time
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional
 
-from pyrogram import Client
-from pyrogram.errors import FloodWait
 from aiogram import Bot
 from aiogram.exceptions import TelegramRetryAfter
+from pyrogram import Client
+from pyrogram.errors import FloodWait
 
 import config
-from database import db
-from duplicate_detector import extract_pyro_signatures, factor_of
+import ui
+from duplicate_detector import extract_pyro_signatures
 
 logger = logging.getLogger("DuplicateBot.HistoryCleaner")
 
-# Only one history clean at a time
-clean_lock = asyncio.Lock()
-
+# in_memory=True: no session file, works on hosts with ephemeral disks
 pyro_client = Client(
-    "duplicate_bot_session",
+    "duplicate_bot_reader",
     api_id=config.API_ID,
     api_hash=config.API_HASH,
     bot_token=config.BOT_TOKEN,
     no_updates=True,
-    workdir="."
+    in_memory=True,
 )
 
-_pyro_started = False
-_pyro_start_lock = asyncio.Lock()
+_started = False
+_start_lock = asyncio.Lock()
+_stop_flags: Dict[int, asyncio.Event] = {}
 
 
 async def ensure_pyro_started():
-    global _pyro_started
-    async with _pyro_start_lock:
-        if not _pyro_started:
+    global _started
+    async with _start_lock:
+        if not _started:
             await pyro_client.start()
-            _pyro_started = True
-            logger.info("HistoryCleaner Pyrogram reader started.")
+            _started = True
+            logger.info("History reader started")
+
+
+async def shutdown_pyro():
+    global _started
+    if _started:
+        try:
+            await pyro_client.stop()
+        except Exception:
+            pass
+        _started = False
+
+
+def request_stop(chat_id: int) -> bool:
+    ev = _stop_flags.get(chat_id)
+    if ev:
+        ev.set()
+        return True
+    return False
 
 
 async def message_exists(chat_id: int, message_id: int) -> Optional[bool]:
-    """
-    True  -> message still exists and still carries media
-    False -> message is gone / has no media
-    None  -> could not verify (caller must treat as "do NOT delete")
-    """
+    """True = exists with media, False = gone, None = could not verify (caller must NOT delete)."""
     try:
         await ensure_pyro_started()
         try:
@@ -56,7 +73,7 @@ async def message_exists(chat_id: int, message_id: int) -> Optional[bool]:
             return False
         return bool(msg.media)
     except Exception as e:
-        logger.warning(f"Could not verify original {message_id} in {chat_id}: {e}")
+        logger.warning(f"Could not verify {message_id} in {chat_id}: {e}")
         return None
 
 
@@ -65,8 +82,10 @@ async def _fetch(chat_id: int, ids: List[int]):
         try:
             return await pyro_client.get_messages(chat_id, ids)
         except FloodWait as e:
-            logger.warning(f"FloodWait {e.value}s while fetching")
             await asyncio.sleep(e.value)
+        except Exception as e:
+            logger.error(f"Fetch failed for {ids[0]}-{ids[-1]}: {e}")
+            return None
     return None
 
 
@@ -77,8 +96,7 @@ async def _delete(bot: Bot, chat_id: int, ids: List[int]) -> int:
             return len(ids)
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after)
-        except Exception as e:
-            logger.error(f"Batch delete failed ({e}); falling back to single deletes")
+        except Exception:
             ok = 0
             for mid in ids:
                 try:
@@ -97,105 +115,88 @@ async def fast_clean_chat(
     min_id: int = 1,
     status_msg=None,
     dry_run: bool = False,
+    progress_markup=None,
 ) -> Dict[str, Any]:
-    """
-    Streaming cleaner (oldest -> newest). The OLDEST copy is always the original and is
-    never deleted. dry_run=True scans and reports but deletes nothing.
-    """
     await ensure_pyro_started()
+    stop = _stop_flags[chat_id] = asyncio.Event()
 
-    total_scanned = total_media = total_deleted = total_flagged = 0
-    seen: Dict[str, int] = {}                 # signature -> original message id
-    originals: Dict[int, Dict[str, Any]] = {} # original msg id -> record to seed in DB
+    scanned = media = deleted = flagged = 0
+    seen: Dict[int, int] = {}           # fingerprint hash -> original message id
     type_counts: Dict[str, int] = {}
     factor_counts: Dict[str, int] = {}
     preview: List[str] = []
-
-    batch_size = 100
     last_ui = time.time()
-    start = time.time()
+    started = time.time()
     current = min_id
+    cancelled = False
 
-    while current <= max_id:
-        end = min(current + batch_size - 1, max_id)
-        msgs = await _fetch(chat_id, list(range(current, end + 1)))
-        if msgs is None:
-            logger.error(f"Skipping batch {current}-{end} (fetch failed, nothing deleted)")
-            current += batch_size
-            continue
-
-        dups: List[Dict[str, Any]] = []
-        for msg in msgs:
-            total_scanned += 1
-            if not msg or getattr(msg, "empty", False) or not msg.media:
+    try:
+        while current <= max_id:
+            if stop.is_set():
+                cancelled = True
+                break
+            end = min(current + 99, max_id)
+            msgs = await _fetch(chat_id, list(range(current, end + 1)))
+            if msgs is None:
+                current = end + 1   # fetch failed -> skip batch, delete nothing
                 continue
-            sigs, mtype, fsize = extract_pyro_signatures(msg)
-            if not sigs:
-                continue
-            total_media += 1
 
-            hit = next((s for s in sigs if s in seen), None)
-            if hit:
-                orig_id = seen[hit]
-                dups.append({"id": msg.id, "orig": orig_id, "factor": factor_of(hit), "type": mtype})
-            else:
-                for s in sigs:
-                    seen[s] = msg.id
-                originals[msg.id] = {"message_id": msg.id, "sigs": sigs,
-                                     "media_type": mtype, "file_size": fsize}
+            dups = []
+            for msg in msgs:
+                scanned += 1
+                if not msg or getattr(msg, "empty", False) or not msg.media:
+                    continue
+                fps, mtype, _size = extract_pyro_signatures(msg)
+                if not fps:
+                    continue
+                media += 1
+                hit = next(((h, f) for h, f in fps if h in seen), None)
+                if hit:
+                    dups.append({"id": msg.id, "orig": seen[hit[0]], "factor": hit[1], "type": mtype})
+                else:
+                    for h, _f in fps:
+                        seen[h] = msg.id
 
-        total_flagged += len(dups)
-        for d in dups:
-            type_counts[d["type"]] = type_counts.get(d["type"], 0) + 1
-            factor_counts[d["factor"]] = factor_counts.get(d["factor"], 0) + 1
-            if len(preview) < 15:
-                preview.append(f"{d['id']} -> copy of {d['orig']} ({d['factor']})")
+            flagged += len(dups)
+            for d in dups:
+                type_counts[d["type"]] = type_counts.get(d["type"], 0) + 1
+                factor_counts[d["factor"]] = factor_counts.get(d["factor"], 0) + 1
+                if len(preview) < 10:
+                    preview.append(f"{d['id']} -> {d['orig']}")
 
-        if dups and not dry_run:
-            ids = [d["id"] for d in dups]
-            for i in range(0, len(ids), 100):
-                total_deleted += await _delete(bot, chat_id, ids[i:i + 100])
-            await db.log_deletions(chat_id, [
-                {"message_id": d["id"], "original_id": d["orig"],
-                 "factor": d["factor"], "media_type": d["type"], "source": "history_clean"}
-                for d in dups
-            ])
+            if dups and not dry_run:
+                ids = [d["id"] for d in dups]
+                for i in range(0, len(ids), 100):
+                    deleted += await _delete(bot, chat_id, ids[i:i + 100])
 
-        if status_msg and time.time() - last_ui > 3.0:
-            pct = min(round(end / max_id * 100, 1), 100.0) if max_id else 100.0
-            label = "DRY RUN (nothing will be deleted)" if dry_run else "Cleaning"
-            try:
-                await status_msg.edit_text(
-                    f"⚡ <b>{label}...</b>\n\n"
-                    f"📊 <b>Progress:</b> <code>{end}/{max_id}</code> ({pct}%)\n"
-                    f"📁 <b>Media Analyzed:</b> <code>{total_media}</code>\n"
-                    f"🗑️ <b>{'Duplicates Found' if dry_run else 'Deleted'}:</b> "
-                    f"<code>{total_flagged if dry_run else total_deleted}</code>"
-                )
-                last_ui = time.time()
-            except Exception:
-                pass
+            if status_msg and time.time() - last_ui > 3.0:
+                try:
+                    await status_msg.edit_text(
+                        ui.progress_text(end - min_id + 1, max_id - min_id + 1, media,
+                                         flagged if dry_run else deleted, dry_run),
+                        reply_markup=progress_markup,
+                    )
+                    last_ui = time.time()
+                except Exception:
+                    pass
 
-        current += batch_size
-        await asyncio.sleep(0.7)
+            current = end + 1
+            await asyncio.sleep(0.7)
+    finally:
+        _stop_flags.pop(chat_id, None)
 
-    if not dry_run:
-        # Per-type stats in one write each, and teach live mode about every original.
-        for mtype, cnt in type_counts.items():
-            await db.record_deletions(chat_id, mtype, cnt)
-        await db.bulk_seed(chat_id, list(originals.values()))
-
-    elapsed = round(time.time() - start, 1)
-    logger.info(f"✅ CLEAN {'(dry run) ' if dry_run else ''}done: scanned={total_scanned} "
-                f"flagged={total_flagged} deleted={total_deleted} in {elapsed}s")
+    elapsed = round(time.time() - started, 1)
+    logger.info(f"clean {'(dry) ' if dry_run else ''}chat={chat_id} scanned={scanned} "
+                f"flagged={flagged} deleted={deleted} {elapsed}s cancelled={cancelled}")
     return {
         "chat_id": chat_id,
         "dry_run": dry_run,
-        "total_scanned": total_scanned,
-        "total_media": total_media,
-        "duplicates_flagged": total_flagged,
-        "duplicates_deleted": total_deleted,
-        "originals_kept": total_media - total_flagged,
+        "cancelled": cancelled,
+        "total_scanned": scanned,
+        "total_media": media,
+        "duplicates_flagged": flagged,
+        "duplicates_deleted": deleted,
+        "originals_kept": media - flagged,
         "elapsed_seconds": elapsed,
         "type_counts": type_counts,
         "factor_counts": factor_counts,

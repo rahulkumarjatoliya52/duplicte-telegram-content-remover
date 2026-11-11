@@ -1,79 +1,36 @@
-# 🤖 Telegram Duplicate Media Remover Bot (Safe Multi-Factor Edition)
+# 🧹 Duplicate Media Remover Bot
 
-A Telegram bot that, once made an admin in a **Channel** or **Group**, automatically detects and deletes duplicate **photos, videos, audio, documents, GIFs and voice notes** — without deleting originals by mistake.
+Telegram bot that removes duplicate **photos, videos, audio, documents, GIFs and voice notes** from channels and groups, and never deletes the original.
 
----
+## Highlights
+- **Safe detection:** same Telegram file (unique ID) **or** exact size + resolution + duration together. Weak matches never delete anything. The oldest copy always stays.
+- **Original check:** before a live delete, the bot verifies the original message still exists. Any doubt means the file is kept.
+- **Private per user:** each user only sees chats they added/own. Others can never see or clean them.
+- **Tiny database (512 MB friendly):** history scans run in memory and store nothing. Live-detection records are small integers that expire (TTL), are capped per chat, wiped after every clean, and removed when the bot leaves a chat. A global size guard purges the oldest data above `DB_SOFT_LIMIT_MB`.
+- **Clean chats:** in private chat, every 3rd action deletes older messages above the newest one. In groups/channels, bot replies and command messages auto-disappear.
+- **24/7 uptime:** built-in web server (`/health`), self-ping, auto-restart supervisor with backoff, Docker healthcheck.
+- **Professional UI:** inline menus, chat panels, progress bar with ⏹ Stop, dry-run reports with a one-tap "Delete these duplicates", confirmation before any destructive action.
 
-## 🔍 Safe Detection
+## Using it
+1. Add the bot to your channel/group as admin with **Delete Messages**.
+2. Open the bot in private chat ➜ **My Chats** ➜ pick the chat.
+3. **Dry Run** ➜ review ➜ **Delete these duplicates** (or **Clean**).
 
-The old engine deleted a file if **any single weak factor** matched (for example only duration + resolution, or caption + dimensions). Many different videos share those, so originals were being deleted. Now only **two strong fingerprints** are used:
+Commands: `/menu /chats /clean /reset /stats /help /commands /about /ping`
+In groups/channels (admins): `/clean [dry] [N]`, `/reset`, `/check`, `/del`, `/purge N`, `/stats`.
 
-1. **Telegram Unique ID** – the same file (copy / forward).
-2. **Exact Size + Resolution + Duration, all together** – for video. Photos use size + resolution, audio/voice use size + duration, documents use size + file name.
-
-If any attribute is missing, no size-based fingerprint is created and the file is kept (fail-safe).
-
-### Safety layers
-- The **oldest** copy is always the original and is never deleted.
-- Before a live delete, the bot **verifies the original message still exists**. If the original was deleted, or cannot be verified, the new file is **kept** and becomes the new original.
-- Files smaller than `MIN_FILE_SIZE` are never size-matched.
-- `/clean dry` – a test run that only reports; nothing is deleted.
-- All admin commands are restricted to **AUTH_USERS and group admins**.
-- Every deletion is logged in MongoDB (`deletion_log`): original id, deleted id, reason.
-
----
-
-## ⚡ Fast Streaming Cleaner (`/clean`)
-
-- **Real-time deletion:** duplicates are deleted batch by batch (100 messages at a time) while scanning.
-- **Original safe:** the oldest file stays; only later copies are deleted. Run `/clean dry` first to preview.
-- **Live progress:** the status message updates every 3 seconds.
-- After a real clean, all kept originals are saved to the database so live detection knows them too.
-
----
-
-## 📱 Commands
-
-| Command | Where | Description |
-|---|---|---|
-| `/clean dry` | Channel / Group / DM | Test run: report only, nothing deleted |
-| `/clean` | Channel / Group | Delete duplicates from the full history |
-| `/clean <count>` | Channel / Group | Clean only the last N messages (e.g. `/clean 500`) |
-| `/clean <channel_id> [dry]` | Private DM (owner) | Clean a channel from DM (e.g. `/clean -1004466397591 dry`) |
-| `/del` or `/delete` | Group | Reply to a message to delete it (admins only) |
-| `/purge <count>` | Group | Delete the last N messages (admins only) |
-| `/check` | Group | Reply to media to see if it is a duplicate (admins only) |
-| `/clean_db` | Group / Channel | Reset this chat's stored hashes (admins only) |
-| `/start`, `/help`, `/about`, `/stats`, `/ping` | Anywhere | Menu, guide, info, statistics, latency |
-
----
-
-## ⚙️ Configuration (`.env`)
-
-Copy `.env.example` to `.env` and fill it in.
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `API_ID`, `API_HASH`, `BOT_TOKEN` | – | Telegram credentials |
-| `AUTH_USERS` | – | Comma-separated owner user IDs |
-| `MONGO_URI`, `DATABASE_NAME` | – | MongoDB connection |
-| `DELAY` | `0` | Seconds to wait before deleting a live duplicate |
-| `MIN_FILE_SIZE` | `20480` | Ignore size matching below this many bytes |
-| `VERIFY_ORIGINAL` | `True` | Confirm the original exists before a live delete |
-| `LOG_DELETIONS` / `DELETION_LOG_DAYS` | `True` / `90` | Audit trail |
-| `SEND_DELETE_ALERT` | `False` | Post a notice in groups after a delete |
-
-> ⚠️ Never commit or share your `.env`. If it was shared, rotate the bot token and database password.
-
----
-
-## 🛠️ Run
-
+## Setup
 ```bash
+cp .env.example .env     # fill API_ID, API_HASH, BOT_TOKEN, MONGO_URI, OWNER_IDS
 pip install -r requirements.txt
 python bot.py
 ```
+Docker: `docker compose up -d --build`
 
-or with Docker: `docker compose up -d --build`
+## Keeping the bot awake on free hosts
+The bot opens `PORT` and pings its own public URL every `PING_INTERVAL` seconds. On Render, Koyeb, Railway, Fly and Heroku the URL is detected automatically; elsewhere set `KEEPALIVE_URL`. For extra safety add a free external monitor (UptimeRobot or cron-job.org) hitting `https://YOUR-URL/health` every 5 minutes.
 
-**Recommended first run:** make the bot admin (with *Delete Messages*) in a test channel → `/clean_db` → `/clean dry` → review the report → `/clean`.
+## Configuration
+See `.env.example`. Important values: `RECORD_TTL_DAYS` (7), `MAX_RECORDS_PER_CHAT` (20000), `DB_SOFT_LIMIT_MB` (380), `AUTO_WIPE_AFTER_CLEAN` (True), `TIDY_EVERY_N_ACTIONS` (3), `GROUP_REPLY_TTL` (60).
+
+> ⚠️ Never share your `.env`. If it was shared, rotate the bot token and database password.

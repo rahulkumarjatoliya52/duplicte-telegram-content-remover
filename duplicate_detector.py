@@ -1,52 +1,38 @@
 """
-Strict duplicate fingerprints.
+Strict duplicate fingerprints (never delete on a weak match).
 
-Old engine deleted a file if ANY single weak factor matched (e.g. same duration +
-same resolution, or same caption + dimensions). Many different videos share those,
-so originals got deleted.
+  u2  -> same Telegram file (copy / forward)  [file_unique_id]
+  f2  -> exact size AND resolution AND duration (video) / size+resolution (photo) /
+         size+duration (audio, voice) / size+file name (document)
 
-New rule: only two kinds of fingerprints exist, and each is strong on its own:
-
-  u2:<file_unique_id>
-      Same Telegram file (forwarded / re-posted copy). Telegram guarantees this.
-
-  f2:<type>:<exact size>:<ALL other attributes>
-      Same exact byte size AND resolution AND duration (video), size+resolution
-      (photo), size+duration (audio/voice), size+filename (document).
-      Missing attribute -> no f2 fingerprint -> file is kept (fail-safe).
+Fingerprints are stored as 63-bit integers (not strings) to save database space.
 """
-import logging
+import hashlib
 from typing import List, Optional, Tuple
 
 import config
 
-logger = logging.getLogger("DuplicateBot.Detector")
-
 FACTOR_NAMES = {
-    "u2": "Telegram Unique ID",
-    "f2": "Exact Size + Resolution/Duration/Name",
+    "u2": "Telegram unique ID",
+    "f2": "Exact size + resolution/duration",
 }
 
+Fingerprint = Tuple[int, str]  # (hash, factor)
 
-def build_signatures(
-    media_type: str,
-    unique_id: Optional[str],
-    size: int,
-    width: int = 0,
-    height: int = 0,
-    duration: int = 0,
-    name: str = "",
-) -> List[str]:
+
+def _h(sig: str) -> int:
+    return int.from_bytes(hashlib.blake2b(sig.encode(), digest_size=8).digest(), "big") >> 1
+
+
+def build_signatures(media_type, unique_id, size, width=0, height=0, duration=0, name="") -> List[str]:
     sigs: List[str] = []
     size = size or 0
-    width = width or 0
-    height = height or 0
+    width, height = width or 0, height or 0
     duration = int(round(duration or 0))
     name = (name or "").strip().lower()
 
     if unique_id:
         sigs.append(f"u2:{unique_id}")
-
     if size < config.MIN_FILE_SIZE:
         return sigs
 
@@ -65,68 +51,51 @@ def build_signatures(
     return sigs
 
 
-def factor_of(sig: str) -> str:
-    return sig.split(":", 1)[0]
+def fingerprints(sigs: List[str]) -> List[Fingerprint]:
+    return [(_h(s), s.split(":", 1)[0]) for s in sigs]
 
 
-def extract_multi_factor_signatures(message) -> Optional[Tuple[str, List[str], int]]:
-    """aiogram Message -> (media_type, signatures, file_size) or None."""
-    if message.video:
-        m, t = message.video, "video"
-        sigs = build_signatures(t, m.file_unique_id, m.file_size, m.width, m.height, m.duration)
-    elif message.photo:
-        m, t = message.photo[-1], "photo"
-        sigs = build_signatures(t, m.file_unique_id, m.file_size, m.width, m.height)
-    elif message.audio:
-        m, t = message.audio, "audio"
-        sigs = build_signatures(t, m.file_unique_id, m.file_size, duration=m.duration)
-    elif message.document:
-        m, t = message.document, "document"
-        sigs = build_signatures(t, m.file_unique_id, m.file_size, name=m.file_name or "")
-    elif message.animation:
-        m, t = message.animation, "animation"
-        sigs = build_signatures(t, m.file_unique_id, m.file_size, m.width, m.height, m.duration)
-    elif message.voice:
-        m, t = message.voice, "voice"
-        sigs = build_signatures(t, m.file_unique_id, m.file_size, duration=m.duration)
-    elif message.video_note:
-        m, t = message.video_note, "video_note"
-        sigs = build_signatures(t, m.file_unique_id, m.file_size, m.length, m.length, m.duration)
-    else:
+def _collect(m_type: str, m, kind: str):
+    """Pull attributes from an aiogram/pyrogram media object."""
+    uid = getattr(m, "file_unique_id", None)
+    size = getattr(m, "file_size", 0) or 0
+    w = getattr(m, "width", 0) or 0
+    h = getattr(m, "height", 0) or 0
+    d = getattr(m, "duration", 0) or 0
+    name = getattr(m, "file_name", "") or ""
+    if m_type == "video_note":
+        w = h = getattr(m, "length", 0) or 0
+    return build_signatures(m_type, uid, size, w, h, d, name), size
+
+
+_ORDER = ("video", "photo", "audio", "document", "animation", "voice", "video_note")
+
+
+def _pick(msg):
+    for t in _ORDER:
+        obj = getattr(msg, t, None)
+        if obj:
+            if t == "photo" and isinstance(obj, list):  # aiogram: list of sizes
+                obj = obj[-1]
+            return t, obj
+    return None, None
+
+
+def extract_multi_factor_signatures(message) -> Optional[Tuple[str, List[Fingerprint], int]]:
+    """aiogram Message -> (media_type, fingerprints, size) or None."""
+    t, obj = _pick(message)
+    if not t:
         return None
-
-    if not sigs:
-        return None
-    return t, sigs, (m.file_size or 0)
+    sigs, size = _collect(t, obj, "aiogram")
+    return (t, fingerprints(sigs), size) if sigs else None
 
 
-def extract_pyro_signatures(msg) -> Tuple[List[str], Optional[str], int]:
-    """Pyrogram Message -> (signatures, media_type, file_size). Same rules as above."""
-    if not msg or not msg.media:
+def extract_pyro_signatures(msg) -> Tuple[List[Fingerprint], Optional[str], int]:
+    """Pyrogram Message -> (fingerprints, media_type, size). Same rules as above."""
+    if not msg or not getattr(msg, "media", None):
         return [], None, 0
-
-    if msg.video:
-        m, t = msg.video, "video"
-        sigs = build_signatures(t, m.file_unique_id, m.file_size, m.width, m.height, m.duration)
-    elif msg.photo:
-        m, t = msg.photo, "photo"
-        sigs = build_signatures(t, m.file_unique_id, m.file_size, m.width, m.height)
-    elif msg.audio:
-        m, t = msg.audio, "audio"
-        sigs = build_signatures(t, m.file_unique_id, m.file_size, duration=m.duration)
-    elif msg.document:
-        m, t = msg.document, "document"
-        sigs = build_signatures(t, m.file_unique_id, m.file_size, name=m.file_name or "")
-    elif msg.animation:
-        m, t = msg.animation, "animation"
-        sigs = build_signatures(t, m.file_unique_id, m.file_size, m.width, m.height, m.duration)
-    elif msg.voice:
-        m, t = msg.voice, "voice"
-        sigs = build_signatures(t, m.file_unique_id, m.file_size, duration=m.duration)
-    elif msg.video_note:
-        m, t = msg.video_note, "video_note"
-        sigs = build_signatures(t, m.file_unique_id, m.file_size, m.length, m.length, m.duration)
-    else:
+    t, obj = _pick(msg)
+    if not t:
         return [], None, 0
-
-    return sigs, t, (m.file_size or 0)
+    sigs, size = _collect(t, obj, "pyrogram")
+    return fingerprints(sigs), t, size
